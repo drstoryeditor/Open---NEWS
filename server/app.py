@@ -12,7 +12,8 @@ Fixes in this version
 4. Full permissions: the desk can list, load, save, upload and delete ANY file
    in site/ (index, paper, archives, images — everything).
 """
-import hashlib, hmac, json, os, re, secrets, threading, time
+import base64, hashlib, hmac, json, os, re, secrets, threading, time
+import urllib.parse, urllib.request, urllib.error
 from datetime import datetime
 from pathlib import Path
 
@@ -31,6 +32,154 @@ app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 64 * 1024 * 1024   # 64 MB uploads
 FAILS = {}   # ip -> [count, lock_until]
 WRITE_LOCK = threading.Lock()   # serialises publish/upload/save/delete
+
+# ---------------- GitHub sync (survive Render restarts) ----------------
+# Set on Render:  GITHUB_TOKEN  (fine-grained PAT, Contents: Read & write)
+#                 GITHUB_REPO   (e.g.  yourname/open-news)
+# Optional:       GITHUB_BRANCH (default main), GITHUB_PREFIX (default site)
+
+GITHUB_TOKEN  = os.environ.get('GITHUB_TOKEN', '')
+GITHUB_REPO   = os.environ.get('GITHUB_REPO', '')
+GITHUB_BRANCH = os.environ.get('GITHUB_BRANCH', 'main')
+GITHUB_PREFIX = os.environ.get('GITHUB_PREFIX', 'site').strip('/')
+
+GH_LOCK = threading.Lock()      # serialises pushes so commits never race
+GIT_STATUS = {'state': 'off' if not (GITHUB_TOKEN and GITHUB_REPO) else 'idle',
+              'detail': '' if (GITHUB_TOKEN and GITHUB_REPO) else
+                        'set GITHUB_TOKEN and GITHUB_REPO env vars to enable',
+              'when': ''}
+
+def gh_enabled():
+    return bool(GITHUB_TOKEN and GITHUB_REPO)
+
+def _gh_api(method, path, payload=None):
+    data = json.dumps(payload).encode('utf-8') if payload is not None else None
+    req = urllib.request.Request('https://api.github.com' + path, data=data, method=method,
+        headers={'Authorization': 'Bearer ' + GITHUB_TOKEN,
+                 'Accept': 'application/vnd.github+json',
+                 'User-Agent': 'open-news-desk',
+                 'X-GitHub-Api-Version': '2022-11-28'})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.status, json.loads(r.read().decode('utf-8') or '{}')
+    except urllib.error.HTTPError as e:
+        try:
+            body = json.loads(e.read().decode('utf-8') or '{}')
+        except Exception:
+            body = {}
+        return e.code, body
+    except Exception as e:
+        return 0, {'message': str(e)}
+
+def _repo_path(rel):
+    return (GITHUB_PREFIX + '/' + rel) if GITHUB_PREFIX else rel
+
+def _gh_put(rel, data, message):
+    api = '/repos/%s/contents/%s' % (GITHUB_REPO, urllib.parse.quote(_repo_path(rel)))
+    st, j = _gh_api('GET', api + '?ref=' + GITHUB_BRANCH)
+    payload = {'message': message + ' [skip render]', 'branch': GITHUB_BRANCH,
+               'content': base64.b64encode(data).decode('ascii')}
+    if st == 200 and isinstance(j, dict) and j.get('sha'):
+        payload['sha'] = j['sha']
+    st, j = _gh_api('PUT', api, payload)
+    return st in (200, 201), st, (j.get('message', '') if isinstance(j, dict) else '')
+
+def _gh_delete(rel, message):
+    api = '/repos/%s/contents/%s' % (GITHUB_REPO, urllib.parse.quote(_repo_path(rel)))
+    st, j = _gh_api('GET', api + '?ref=' + GITHUB_BRANCH)
+    if st != 200 or not isinstance(j, dict) or not j.get('sha'):
+        return True, st, 'already absent'
+    st, j = _gh_api('DELETE', api, {'message': message + ' [skip render]',
+                                    'branch': GITHUB_BRANCH, 'sha': j['sha']})
+    return st in (200, 201), st, (j.get('message', '') if isinstance(j, dict) else '')
+
+def _set_git_status(state, detail=''):
+    GIT_STATUS.update(state=state, detail=detail,
+                      when=datetime.now().strftime('%H:%M:%S'))
+
+def git_sync(puts=(), deletes=(), message='desk update'):
+    """Commit the given site-relative paths to GitHub. Runs in background."""
+    if not gh_enabled():
+        return
+    def work():
+        with GH_LOCK:
+            _set_git_status('syncing', message)
+            errs = []
+            for rel in puts:
+                p = SITE / rel
+                if not p.is_file():
+                    continue
+                ok, st, msg = _gh_put(rel, p.read_bytes(), 'desk: ' + message)
+                if not ok:
+                    errs.append('%s (%s %s)' % (rel, st, msg))
+            for rel in deletes:
+                ok, st, msg = _gh_delete(rel, 'desk: ' + message)
+                if not ok:
+                    errs.append('del %s (%s %s)' % (rel, st, msg))
+            if errs:
+                _set_git_status('error', '; '.join(errs)[:300])
+            else:
+                _set_git_status('ok', message)
+    threading.Thread(target=work, daemon=True).start()
+
+def _archive_extras():
+    """Paths that change whenever the archive shelf changes."""
+    extras = ['archives.html', 'archives/manifest.json']
+    return [e for e in extras if (SITE / e).is_file()]
+
+def git_pull_site():
+    """On boot/wake: restore the whole site/ folder from GitHub so a disk
+    reset (Render free tier) can never roll the paper back."""
+    if not gh_enabled():
+        return
+    with GH_LOCK:
+        _set_git_status('pulling', 'restoring site from GitHub')
+        st, j = _gh_api('GET', '/repos/%s/git/trees/%s?recursive=1'
+                        % (GITHUB_REPO, urllib.parse.quote(GITHUB_BRANCH)))
+        if st != 200 or 'tree' not in j:
+            _set_git_status('error', 'pull failed: tree %s %s' % (st, j.get('message', '')))
+            return
+        want = GITHUB_PREFIX + '/' if GITHUB_PREFIX else ''
+        n = 0
+        for item in j['tree']:
+            if item.get('type') != 'blob':
+                continue
+            path = item.get('path', '')
+            if want and not path.startswith(want):
+                continue
+            rel = path[len(want):]
+            st2, b = _gh_api('GET', '/repos/%s/git/blobs/%s' % (GITHUB_REPO, item['sha']))
+            if st2 != 200 or b.get('content') is None:
+                continue
+            try:
+                data = base64.b64decode(b['content'])
+            except Exception:
+                continue
+            target = SITE / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if target.is_file() and target.read_bytes() == data:
+                continue
+            target.write_bytes(data)
+            n += 1
+        try:
+            rebuild_archive_index()
+        except Exception:
+            pass
+        _set_git_status('ok', 'boot pull: %d file(s) restored' % n)
+
+# ---------------- keep-alive (Render free tier must not sleep) ----------------
+
+def _keepalive():
+    url = os.environ.get('RENDER_EXTERNAL_URL', '').rstrip('/')
+    if not url:
+        return
+    while True:
+        time.sleep(600)   # every 10 minutes (Render idles at ~15)
+        try:
+            urllib.request.urlopen(url + '/ping', timeout=25)
+        except Exception:
+            pass
+
 
 # ---------------- stateless sessions (survive restarts) ----------------
 
@@ -250,6 +399,16 @@ def safe_site_path(name):
 TEXT_EXT = {'.html', '.htm', '.css', '.js', '.json', '.txt', '.svg', '.xml', '.md'}
 PROTECTED = {'index.html', 'paper.html', 'archives.html'}
 
+@app.route('/ping')
+def ping():
+    return 'ok'
+
+@app.route('/admin/api/gitstatus')
+def api_gitstatus():
+    if (g := guard()):
+        return g
+    return noindex(jsonify(ok=True, enabled=gh_enabled(), **GIT_STATUS))
+
 @app.route('/admin/api/publish', methods=['POST'])
 def api_publish():
     if (g := guard()):
@@ -270,6 +429,12 @@ def api_publish():
             (SITE / 'paper.html').write_text(html, encoding='utf-8')
     except Exception as e:
         return noindex(jsonify(ok=False, error=f'server error while publishing: {e}'))
+    puts = ['paper.html']
+    if do_archive:
+        puts += _archive_extras()
+        puts += ['archives/' + f.name for f in sorted(ARCH.glob('*.html'),
+                 key=lambda p: p.stat().st_mtime, reverse=True)[:1]]
+    git_sync(puts=puts, message='publish' + (' & archive' if do_archive else ' only'))
     if do_archive:
         return noindex(jsonify(ok=True, archived=label or 'nothing to archive'))
     return noindex(jsonify(ok=True, archived=None))
@@ -313,6 +478,9 @@ def api_file():
                 rebuild_archive_index()
     except Exception as e:
         return noindex(jsonify(ok=False, error=f'save failed: {e}'))
+    rel = str(target.relative_to(SITE))
+    puts = [rel] + (_archive_extras() if rel.startswith('archives/') else [])
+    git_sync(puts=puts, message='edit ' + rel)
     return noindex(jsonify(ok=True))
 
 @app.route('/admin/api/upload', methods=['POST'])
@@ -334,6 +502,9 @@ def api_upload():
                 rebuild_archive_index()
     except Exception as e:
         return noindex(jsonify(ok=False, error=f'upload failed: {e}'))
+    rel = str(target.relative_to(SITE))
+    puts = [rel] + (_archive_extras() if rel.startswith('archives/') else [])
+    git_sync(puts=puts, message='upload ' + rel)
     return noindex(jsonify(ok=True, saved=name))
 
 @app.route('/admin/api/delete', methods=['POST'])
@@ -358,6 +529,8 @@ def api_delete():
                 rebuild_archive_index()
     except Exception as e:
         return noindex(jsonify(ok=False, error=f'delete failed: {e}'))
+    puts = _archive_extras() if name.startswith('archives/') else []
+    git_sync(puts=puts, deletes=[name], message='delete ' + name)
     return noindex(jsonify(ok=True))
 
 # ---------------- admin pages ----------------
@@ -463,6 +636,7 @@ def page_desk():
     <button class="ghost" onclick="publish(false)">Publish only</button>
     <span id="pubmsg" class="msg"></span>
   </div>
+  <p class="note" id="gitline" style="margin-top:8px;">GitHub sync: checking&hellip;</p>
 
   <div class="kicker">Two &middot; Edit Any File</div>
   <p class="note">Type a path (e.g. index.html &middot; paper.html &middot; archives/20260830-0339.html), load, edit, save.</p>
@@ -517,7 +691,7 @@ async function publish(doArchive){{
   const j = await call('/admin/api/publish', {{method:'POST', body:fd}});
   setMsg('pubmsg', j.ok ? (j.archived ? ('published — previous edition archived as “' + j.archived + '”')
                                       : 'published — live paper replaced (nothing archived)') : j.error, j.ok);
-  if(j.ok) listFiles();
+  if(j.ok){{ listFiles(); setTimeout(gitStatus, 1200); }}
 }}
 async function loadFile(){{
   const n = document.getElementById('fname').value.trim();
@@ -531,7 +705,7 @@ async function saveFile(){{
     headers:{{'Content-Type':'application/json'}},
     body: JSON.stringify({{name:n, content:document.getElementById('content').value}})}});
   setMsg('editmsg', j.ok ? 'saved ' + n : j.error, j.ok);
-  if(j.ok) listFiles();
+  if(j.ok){{ listFiles(); setTimeout(gitStatus, 1200); }}
 }}
 async function uploadFile(){{
   const f = document.getElementById('upfile').files[0];
@@ -542,14 +716,25 @@ async function uploadFile(){{
   setMsg('upmsg','uploading…',true);
   const j = await call('/admin/api/upload', {{method:'POST', body:fd}});
   setMsg('upmsg', j.ok ? 'saved as ' + j.saved : j.error, j.ok);
-  if(j.ok) listFiles();
+  if(j.ok){{ listFiles(); setTimeout(gitStatus, 1200); }}
 }}
 async function delFile(name){{
   if(!confirm('Delete ' + name + ' permanently?')) return;
   const j = await call('/admin/api/delete', {{method:'POST',
     headers:{{'Content-Type':'application/json'}}, body: JSON.stringify({{name:name}})}});
   if(!j.ok) alert(j.error);
-  listFiles();
+  listFiles(); setTimeout(gitStatus, 1200);
+}}
+async function gitStatus(){{
+  const j = await call('/admin/api/gitstatus');
+  const el = document.getElementById('gitline');
+  if(!el) return;
+  if(!j.ok){{ el.textContent = 'GitHub sync: unknown'; return; }}
+  if(!j.enabled){{ el.innerHTML = 'GitHub sync: <b>off</b> — ' + j.detail; return; }}
+  const map = {{idle:'ready', syncing:'committing\u2026', pulling:'restoring from repo\u2026', ok:'\u2713 committed', error:'\u2717 FAILED'}};
+  el.innerHTML = 'GitHub sync: <b>' + (map[j.state]||j.state) + '</b>' +
+    (j.detail ? ' — ' + j.detail : '') + (j.when ? ' (' + j.when + ')' : '');
+  if(j.state === 'syncing' || j.state === 'pulling') setTimeout(gitStatus, 2000);
 }}
 function fmtSize(b){{
   return b > 1048576 ? (b/1048576).toFixed(1) + ' MB' : b > 1024 ? (b/1024).toFixed(0) + ' KB' : b + ' B';
@@ -573,7 +758,7 @@ async function listFiles(){{
     ul.appendChild(li);
   }}
 }}
-listFiles();
+listFiles(); gitStatus();
 </script></body></html>'''
 
 @app.errorhandler(401)
@@ -589,6 +774,12 @@ def toobig(e):
     return noindex(make_response(jsonify(ok=False, error='file too large (max 64 MB)'), 413))
 
 rebuild_archive_index()   # runs on import (gunicorn) too
+
+# On boot/wake: restore latest site from GitHub (background, non-blocking),
+# then keep the Render instance awake so the paper never sleeps.
+if gh_enabled():
+    threading.Thread(target=git_pull_site, daemon=True).start()
+threading.Thread(target=_keepalive, daemon=True).start()
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
