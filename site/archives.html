@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Open - News &middot; Archives</title>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+html, body { background:#100e0c; }
+#stage { width:900px; transform-origin:top left; }
+.page { width:900px; background:#fbf8ef; color:#151310; padding:40px 48px;
+  font-family:Georgia, 'Times New Roman', serif; min-height:600px; }
+h1 { font-size:52px; text-align:center; border-bottom:3px double #151310; padding-bottom:14px; }
+.sub { text-align:center; font-style:italic; color:#4d463a; padding:10px 0 24px 0; }
+ul { list-style:none; }
+li { padding:12px 4px; border-bottom:1px dotted #bdb298; font-size:18px; }
+li a { color:#8f1d1d; text-decoration:none; font-weight:bold; }
+li a:hover { color:#151310; }
+li .d { float:right; color:#77705f; font-size:14px; font-style:italic; }
+li.none { color:#4d463a; font-style:italic; }
+.back { display:block; text-align:center; margin-top:28px; font-size:15px; }
+.back a { color:#151310; }
+</style></head>
+<body><div id="stage"><div class="page">
+<h1>The Archives</h1>
+<div class="sub">Every past edition of Open - News, kept the way a library keeps its Sundays.</div>
+<ul>
+<li class="none">No archived editions yet. The first archive appears when a new edition replaces this week&rsquo;s.</li>
+</ul>
+<span class="back"><a href="index.html">&larr; back to the front page</a></span>
+</div></div>
+<script>
+(function(){
+  var s = document.getElementById('stage');
+  function refit(){
+    s.style.transform='none'; s.style.marginLeft='0';
+    var w = s.getBoundingClientRect().width;
+    var vw = document.documentElement.clientWidth;
+    var sc = Math.min(1, vw / w);
+    s.style.transformOrigin='top left';
+    s.style.transform='scale('+sc+')';
+    s.style.marginLeft = Math.max(0,(vw-w*sc)/2)+'px';
+    document.body.style.height=(s.scrollHeight*sc)+'px';
+    document.body.style.overflowX='hidden';
+  }
+  window.addEventListener('resize',refit); window.addEventListener('load',refit); refit();
+})();
+</script></body></html>
